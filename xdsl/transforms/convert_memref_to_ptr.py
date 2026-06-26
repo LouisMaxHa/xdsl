@@ -51,6 +51,14 @@ def build_bytes_offset(
     bytes_per_element_op = builder.insert_op(
         ptr.TypeOffsetOp(element_type, _index_type)
     )
+    # TypeOffsetOp produit toujours un `index`. Si elements_offset est d'un type
+    # entier différent (e.g. i64), on le ramène à `index` pour que arith.muli
+    # soit valide. ConvertPtrAddOp recastera ensuite l'offset en i64 pour LLVM.
+    if not isinstance(elements_offset.type, builtin.IndexType):
+        cast_op = builder.insert_op(
+            arith.IndexCastOp(elements_offset, _index_type)
+        )
+        elements_offset = cast_op.result
     bytes_offset = builder.insert_op(
         arith.MuliOp(elements_offset, bytes_per_element_op)
     )
@@ -510,7 +518,12 @@ class ConvertAllocaPattern(RewritePattern):
             total.name_hint = "c1"
 
         # llvm.alloca %count x element_type -> !llvm.ptr
-        alloca = rewriter.insert_op(llvm.AllocaOp(total, memref_type.element_type))
+        # `index` n'est pas un type LLVM : on alloue en i64 à la place.
+        # Les store/load sur ce pointeur utilisent aussi i64 (via index_cast).
+        element_type = memref_type.element_type
+        if isinstance(element_type, builtin.IndexType):
+            element_type = builtin.i64
+        alloca = rewriter.insert_op(llvm.AllocaOp(total, element_type))
         alloca.res.name_hint = op.memref.name_hint
 
         # !llvm.ptr -> !ptr_xdsl.ptr  (reconcilable bridge cast)
