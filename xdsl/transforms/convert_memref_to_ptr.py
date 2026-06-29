@@ -461,6 +461,27 @@ class ConvertReinterpretCastOp(RewritePattern):
 
 
 @dataclass
+class ConvertViewPattern(RewritePattern):
+    """
+    Lowers `memref.view src[byte_shift][] : memref<NxT> to memref<R>` vers des
+    opérations sur pointeurs.
+
+    `byte_shift` est déjà un offset en octets (pas en éléments), donc on peut
+    faire directement : to_ptr → ptradd(byte_shift) → from_ptr(result_type).
+    """
+
+    @op_type_rewrite_pattern
+    def match_and_rewrite(self, op: memref.ViewOp, rewriter: PatternRewriter, /):
+        pointer = rewriter.insert_op(ptr.ToPtrOp(op.source)).res
+        pointer.name_hint = op.source.name_hint
+
+        byte_shift = op.byte_shift
+        pointer = build_offset_pointer(pointer, byte_shift, rewriter)
+
+        rewriter.replace_op(op, ptr.FromPtrOp(pointer, op.result.type))
+
+
+@dataclass
 class ConvertAllocaPattern(RewritePattern):
     """
     Lowers `memref.alloca` to `llvm.alloca + ptr.from_ptr`.
@@ -549,6 +570,7 @@ class ConvertMemRefToPtr(ModulePass):
                     ConvertStorePattern(),
                     ConvertLoadPattern(),
                     ConvertSubviewPattern(),
+                    ConvertViewPattern(),
                     ConvertCastOp(),
                     ConvertReinterpretCastOp(),
                 ]
