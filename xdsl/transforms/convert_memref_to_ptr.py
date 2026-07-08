@@ -38,8 +38,22 @@ from xdsl.pattern_rewriter import (
 from xdsl.rewriter import InsertPoint
 from xdsl.utils.exceptions import DiagnosticException
 from xdsl.utils.hints import isa
+from xdsl.utils.symbol_table import SymbolTable
 
 _index_type = builtin.IndexType()
+
+
+def uses_llvm_c_interface(func_op: func.FuncOp) -> bool:
+    return "llvm.emit_c_interface" in func_op.attributes
+
+
+def should_lower_memref_at_boundary(func_op: func.FuncOp, typ: Attribute) -> bool:
+    """
+    Memref function boundaries passed through the MLIR C interface carry a
+    descriptor pointer, not a bare data pointer. Keep the memref type so
+    downstream lowering can extract the aligned pointer from the descriptor.
+    """
+    return isinstance(typ, memref.MemRefType) and not uses_llvm_c_interface(func_op)
 
 
 def build_bytes_offset(
@@ -317,11 +331,11 @@ class LowerMemRefFuncOpPattern(RewritePattern):
     def match_and_rewrite(self, op: func.FuncOp, rewriter: PatternRewriter, /):
         # rewrite function declaration
         new_input_types = [
-            ptr.PtrType() if isinstance(arg, builtin.MemRefType) else arg
+            ptr.PtrType() if should_lower_memref_at_boundary(op, arg) else arg
             for arg in op.function_type.inputs
         ]
         new_output_types = [
-            ptr.PtrType() if isinstance(arg, builtin.MemRefType) else arg
+            ptr.PtrType() if should_lower_memref_at_boundary(op, arg) else arg
             for arg in op.function_type.outputs
         ]
         op.function_type = func.FunctionType.from_lists(
@@ -337,6 +351,8 @@ class LowerMemRefFuncOpPattern(RewritePattern):
         # rewrite arguments
         for arg in op.args:
             if not isinstance(arg_type := arg.type, memref.MemRefType):
+                continue
+            if not should_lower_memref_at_boundary(op, arg_type):
                 continue
 
             old_type = cast(memref.MemRefType, arg_type)
@@ -367,6 +383,10 @@ class LowerMemRefFuncReturnPattern(RewritePattern):
         if not any(isinstance(arg.type, memref.MemRefType) for arg in op.arguments):
             return
 
+        parent = op.parent_op()
+        if isinstance(parent, func.FuncOp) and uses_llvm_c_interface(parent):
+            return
+
         new_arguments: list[SSAValue] = []
 
         # insert `memref -> ptr` casts for memref return values
@@ -383,11 +403,22 @@ class LowerMemRefFuncReturnPattern(RewritePattern):
 
 @dataclass
 class LowerMemRefFuncCallPattern(RewritePattern):
+    @staticmethod
+    def _find_callee(op: func.CallOp) -> func.FuncOp | None:
+        found = SymbolTable.lookup_symbol(op, op.callee)
+        if isinstance(found, func.FuncOp):
+            return found
+        return None
+
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: func.CallOp, rewriter: PatternRewriter, /):
         if not any(
             isinstance(arg.type, memref.MemRefType) for arg in op.arguments
         ) and not any(isinstance(type, memref.MemRefType) for type in op.result_types):
+            return
+
+        callee = self._find_callee(op)
+        if callee is not None and uses_llvm_c_interface(callee):
             return
 
         # rewrite arguments
